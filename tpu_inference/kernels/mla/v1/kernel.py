@@ -487,7 +487,7 @@ def static_validate_inputs(
 
 
 def _mla_ragged_paged_attention_kernel(
-    # Prefetch
+    # Prefetch (SMEM)
     kv_lens_ref,  # [max_num_seqs]
     page_indices_ref,  # [max_num_seqs * pages_per_seq]
     cu_q_lens_ref,  # [max_num_seqs + 1]
@@ -496,12 +496,13 @@ def _mla_ragged_paged_attention_kernel(
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
     bkv_update_ids_ref,  # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
-    # Input
+    # Input (HBM)
     ql_nope_hbm_ref,  # [max_num_tokens, num_q_heads_per_q_packing, q_packing, lkv_dim]
     q_pe_hbm_ref,  # [max_num_tokens, num_q_heads_per_q_packing, q_packing, r_dim]
     new_kv_c_hbm_ref,  # [max_num_tokens_per_kv_packing, kv_packing, lkv_dim]
     new_k_pe_hbm_ref,  # [max_num_tokens_per_kv_packing, kv_packing, r_dim]
     cache_kv_hbm_ref,  # [total_num_pages, page_size_per_kv_packing, kv_packing, align_to(lkv_dim + r_dim, 128)]
+    topk_indices_hbm_ref,  # [max_num_tokens, topk_k] i32 HBM (sentinel [1,1] when is_sparse=False)
     # Output
     o_hbm_ref,  # [max_num_tokens, num_q_heads_per_q_packing, q_packing, lkv_dim]
     updated_cache_kv_hbm_ref,  # [total_num_pages, page_size_per_kv_packing, kv_packing, align_to(lkv_dim + r_dim, 128)]
@@ -515,6 +516,7 @@ def _mla_ragged_paged_attention_kernel(
     l_ref,  # [bq_sz * num_q_heads, 128],
     m_ref,  # [bq_sz * num_q_heads, 128],
     acc_ref,  # [bq_sz * num_q_heads, lkv_dim],
+    topk_block_vmem_ref,  # [bq_sz, topk_k] i32 (sentinel [1,1] when is_sparse=False)
     *,
     sm_scale: float,
     sliding_window: int | None = None,
@@ -527,6 +529,7 @@ def _mla_ragged_paged_attention_kernel(
     bkv_p,
     bq_sz,
     debug_mode: bool = False,
+    is_sparse: bool = False,
 ):
     assert ql_nope_hbm_ref.shape == o_hbm_ref.shape
     # Validation checks on the dimensions
@@ -637,6 +640,41 @@ def _mla_ragged_paged_attention_kernel(
         # TODO(jevinjiang, xiowei): reduce pages_per_seq based on sliding_window.
         if sliding_window is not None:
             mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
+
+        # Optional top-k sparse-attention mask: positions not listed in
+        # topk_indices_hbm_ref for the current query are masked out.
+        # topk_indices_hbm_ref has shape [max_num_tokens, topk_k]; -1 sentinel
+        # entries don't match any real kv_position so they contribute nothing.
+        if is_sparse:
+            # The closure may be called with actual_bq_sz < bq_sz (e.g.,
+            # actual_bq_sz=1 in the decode fast path), so derive shapes from
+            # the runtime ql_nope shape rather than the static bq_sz.
+            actual_bq_sz = ql_nope.shape[0] // num_q_heads
+            q_token_start = q_start + bq_idx * bq_sz
+            # HBM cannot be loaded directly inside Pallas TPU kernel bodies; we
+            # sync_copy the slice we need into a VMEM scratch buffer first,
+            # then read from VMEM.
+            pltpu.sync_copy(
+                topk_indices_hbm_ref.at[pl.ds(q_token_start, bq_sz)],
+                topk_block_vmem_ref,
+            )
+            topk_block = topk_block_vmem_ref[pl.ds(
+                0, actual_bq_sz), :]  # [actual_bq_sz, topk_k]
+            kv_positions = bkv_idx * bkv_sz + lax.broadcasted_iota(
+                jnp.int32, (actual_bq_sz, bkv_sz), 1)  # [actual_bq_sz, bkv_sz]
+            is_selected = jnp.any(
+                topk_block[:, :, None] == kv_positions[:, None, :],
+                axis=1,
+            )  # [actual_bq_sz, bkv_sz]
+            # s.shape is [actual_bq_sz * num_q_heads, bkv_sz]; rows are laid out
+            # as (q0,h0), (q0,h1), ..., (q0,hN-1), (q1,h0), ... — so each query's
+            # mask must repeat across num_q_heads contiguous rows.
+            is_selected_3d = lax.broadcast_in_dim(
+                is_selected, (actual_bq_sz, num_q_heads, bkv_sz), (0, 2))
+            is_selected_s = lax.reshape(is_selected_3d,
+                                        (actual_bq_sz * num_q_heads, bkv_sz))
+            topk_mask = jnp.logical_not(is_selected_s)
+            mask = jnp.logical_or(mask, topk_mask)
 
         if soft_cap is not None:
             s = soft_cap * jnp.tanh(s / soft_cap)
@@ -1109,6 +1147,9 @@ def mla_ragged_paged_attention(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    # Optional sparse attention: per-query top-k key indices. -1 sentinel for
+    # unused slots. When provided, attention is restricted to the listed keys.
+    topk_indices: jax.Array | None = None,  # i32[max_num_tokens, topk_k]
     # Kernel optimization params.
     chunk_prefill_size: int | None = None,
     # Kernel tuning params.
@@ -1223,12 +1264,25 @@ def mla_ragged_paged_attention(
     bkv_sz_per_kv_packing = bkv_p * page_size_per_kv_packing
     grid = (distribution[2], )
 
+    # Build the topk_indices HBM input. For dense MLA we pass a 1x1 sentinel
+    # that the kernel never sync_copies (gated by the static is_sparse=False
+    # flag). When sparse, the kernel sync_copies a slice into VMEM scratch.
+    is_sparse = topk_indices is not None
+    if is_sparse:
+        topk_indices_input = topk_indices
+        topk_k = topk_indices.shape[-1]
+    else:
+        topk_indices_input = jnp.full((1, 1), -1, jnp.int32)
+        topk_k = 1
+
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),
         pl.BlockSpec(memory_space=pltpu.HBM),
         pl.BlockSpec(memory_space=pltpu.HBM),
         pl.BlockSpec(memory_space=pltpu.HBM),
         pl.BlockSpec(memory_space=pltpu.HBM),
+        pl.BlockSpec(
+            memory_space=pltpu.HBM),  # topk_indices (real or sentinel)
     ]
 
     out_specs = [
@@ -1269,6 +1323,11 @@ def mla_ragged_paged_attention(
         jnp.float32,
     )
 
+    topk_block_scratch = pltpu.VMEM(
+        (bq_sz, topk_k),
+        jnp.int32,
+    )
+
     scratch_shapes = [
         bkvc_double_buf,
         bkpe_double_buf,
@@ -1281,6 +1340,8 @@ def mla_ragged_paged_attention(
         l_scratch,
         m_scratch,
         acc_scratch,
+        # Sparse-attention topk scratch (sentinel-sized when is_sparse=False).
+        topk_block_scratch,
     ]
 
     scalar_prefetches = (
@@ -1313,6 +1374,7 @@ def mla_ragged_paged_attention(
                 bq_sz=bq_sz,
                 bkv_p=bkv_p,
                 debug_mode=debug_mode,
+                is_sparse=is_sparse,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
@@ -1346,6 +1408,7 @@ def mla_ragged_paged_attention(
         new_kv_c,
         new_k_pe,
         cache_kv,
+        topk_indices_input,
     )
     output = prepare_outputs(
         output, actual_num_q_heads,
